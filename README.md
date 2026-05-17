@@ -27,8 +27,10 @@ Registers a Pi tool named `generate_image` that uses the Vercel AI Gateway image
 Auth is expected via the AI SDK Gateway provider. Set one of:
 
 ```bash
+export AI_GATEWAY_API_KEY_CODING_AGENT=...
+# or:
 export AI_GATEWAY_API_KEY=...
-# or, optionally:
+# or:
 export VERCEL_AI_GATEWAY_API_KEY=...
 ```
 

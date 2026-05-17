@@ -70,14 +70,17 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const apiKey = process.env.AI_GATEWAY_API_KEY ?? process.env.VERCEL_AI_GATEWAY_API_KEY;
+      const apiKey =
+        process.env.AI_GATEWAY_API_KEY_CODING_AGENT ??
+        process.env.AI_GATEWAY_API_KEY ??
+        process.env.VERCEL_AI_GATEWAY_API_KEY;
       if (!apiKey) {
         return {
           isError: true,
           content: [
             {
               type: "text",
-              text: "Missing AI Gateway auth. Set AI_GATEWAY_API_KEY or VERCEL_AI_GATEWAY_API_KEY, then reload/restart Pi.",
+              text: "Missing AI Gateway auth. Set AI_GATEWAY_API_KEY_CODING_AGENT, AI_GATEWAY_API_KEY, or VERCEL_AI_GATEWAY_API_KEY, then reload/restart Pi.",
             },
           ],
           details: { code: "missing_ai_gateway_api_key" },
