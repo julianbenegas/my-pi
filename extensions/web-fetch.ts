@@ -85,12 +85,11 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, _options, theme, _context) {
       const details = result.details as WebFetchDetails | undefined;
       const text = result.content.find(part => part.type === "text")?.text ?? "";
-      const url = details?.url ?? "unknown URL";
       const status = details?.status == null ? "" : ` (${details.status} ${details.statusText ?? ""})`;
       const preview = details?.preview ?? previewLines(text);
 
       return new Text(
-        [theme.fg(details?.ok === false ? "error" : "success", `Fetched ${url}${status}`), preview].join("\n"),
+        [theme.fg(details?.ok === false ? "error" : "success", `Fetched${status}`), preview].join("\n"),
         0,
         0,
       );
