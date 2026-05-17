@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const webFetchParameters = Type.Object({
@@ -15,6 +16,8 @@ type WebFetchDetails = {
   statusText?: string;
   ok?: boolean;
   headers?: Record<string, string>;
+  lineCount?: number;
+  preview?: string;
   code?: string;
 };
 
@@ -67,9 +70,41 @@ export default function (pi: ExtensionAPI) {
           statusText: response.statusText,
           ok: response.ok,
           headers,
+          lineCount: text.split(/\r?\n/).length,
+          preview: previewLines(text),
         } satisfies WebFetchDetails,
         isError: !response.ok,
       };
     },
+
+    renderCall(args, theme, _context) {
+      const params = args as WebFetchParams;
+      return new Text(theme.fg("muted", `Fetching ${params.url}`), 0, 0);
+    },
+
+    renderResult(result, _options, theme, _context) {
+      const details = result.details as WebFetchDetails | undefined;
+      const text = result.content.find(part => part.type === "text")?.text ?? "";
+      const url = details?.url ?? "unknown URL";
+      const status = details?.status == null ? "" : ` (${details.status} ${details.statusText ?? ""})`;
+      const preview = details?.preview ?? previewLines(text);
+
+      return new Text(
+        [theme.fg(details?.ok === false ? "error" : "success", `Fetched ${url}${status}`), preview].join("\n"),
+        0,
+        0,
+      );
+    },
   });
+}
+
+function previewLines(text: string) {
+  const lines = text.split(/\r?\n/);
+  if (lines.length <= 7) return lines.join("\n");
+
+  const head = lines.slice(0, 3);
+  const tail = lines.slice(-3);
+  const omitted = lines.length - head.length - tail.length;
+
+  return [...head, `... ${omitted} more lines ...`, ...tail].join("\n");
 }
