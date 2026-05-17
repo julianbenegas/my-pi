@@ -1,6 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { generateImage, createGateway } from "ai";
 import { Type } from "typebox";
+import { Image, Text, Container } from "@earendil-works/pi-tui";
+import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -48,6 +50,21 @@ type GenerateImageParams = {
   seed?: number;
   outputDir?: string;
   fileNamePrefix?: string;
+};
+
+type GeneratedImageFile = {
+  path: string;
+  mediaType: string | undefined;
+  bytes: number;
+};
+
+type GenerateImageDetails = {
+  model: string;
+  files: GeneratedImageFile[];
+  warnings?: unknown;
+  usage?: unknown;
+  responses?: unknown;
+  providerMetadata?: unknown;
 };
 
 export default function (pi: ExtensionAPI) {
@@ -141,8 +158,51 @@ export default function (pi: ExtensionAPI) {
           usage: result.usage,
           responses: result.responses,
           providerMetadata: result.providerMetadata,
-        },
+        } satisfies GenerateImageDetails,
       };
+    },
+
+    renderResult(result, _options, theme, _context) {
+      const details = result.details as GenerateImageDetails | undefined;
+      const firstFile = details?.files?.[0];
+      const text = result.content.find(part => part.type === "text")?.text ?? "";
+
+      if (!firstFile) {
+        return new Text(text, 0, 0);
+      }
+
+      try {
+        const imageBase64 = readFileSync(firstFile.path).toString("base64");
+        const container = new Container();
+        container.addChild(new Text(theme.fg("success", "Generated image preview:"), 0, 0));
+        container.addChild(
+          new Image(
+            imageBase64,
+            firstFile.mediaType ?? "image/png",
+            { fallbackColor: (str: string) => theme.fg("muted", str) },
+            {
+              maxWidthCells: 80,
+              maxHeightCells: 24,
+              filename: firstFile.path,
+            },
+          ),
+        );
+        container.addChild(new Text(theme.fg("muted", firstFile.path), 0, 0));
+
+        if (details.files.length > 1) {
+          container.addChild(
+            new Text(
+              theme.fg("dim", [`Additional files:`, ...details.files.slice(1).map(file => `- ${file.path}`)].join("\n")),
+              0,
+              0,
+            ),
+          );
+        }
+
+        return container;
+      } catch (error) {
+        return new Text(`${text}\n\n${theme.fg("warning", `Could not render image preview: ${String(error)}`)}`, 0, 0);
+      }
     },
   });
 }
