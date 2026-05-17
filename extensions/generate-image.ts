@@ -1,8 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { generateImage, createGateway } from "ai";
 import { Type } from "typebox";
-import { Image, Text, Container } from "@earendil-works/pi-tui";
-import { readFileSync } from "node:fs";
+import { Text } from "@earendil-works/pi-tui";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +11,11 @@ const DEFAULT_OUTPUT_DIR = ".pi/generated-images";
 
 const generateImageParameters = Type.Object({
   prompt: Type.String({ description: "Prompt describing the image to generate." }),
+  model: Type.Optional(
+    Type.String({
+      description: `Vercel AI Gateway image model ID. Defaults to ${DEFAULT_MODEL}. Do not override unless the user explicitly asks for a different model.`,
+    }),
+  ),
   n: Type.Optional(
     Type.Number({
       description: "Number of images to generate. Defaults to 1.",
@@ -44,6 +48,7 @@ const generateImageParameters = Type.Object({
 
 type GenerateImageParams = {
   prompt: string;
+  model?: string;
   n?: number;
   size?: string;
   aspectRatio?: string;
@@ -60,6 +65,14 @@ type GeneratedImageFile = {
 
 type GenerateImageDetails = {
   model: string;
+  prompt: string;
+  parameters: {
+    n: number;
+    size?: string;
+    aspectRatio?: string;
+    seed?: number;
+    outputDir: string;
+  };
   files: GeneratedImageFile[];
   warnings?: unknown;
   usage?: unknown;
@@ -71,10 +84,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "generate_image",
     label: "Generate Image",
-    description: "Generate images with Vercel AI Gateway's openai/gpt-image-2 model and write them to disk.",
-    promptSnippet: "Generate images using Vercel AI Gateway openai/gpt-image-2 and save the files locally.",
+    description: "Generate images with Vercel AI Gateway image models and write them to disk.",
+    promptSnippet: "Generate images using Vercel AI Gateway image models and save the files locally.",
     promptGuidelines: [
       "Use generate_image when the user asks to generate or create an AI image file.",
+      `Use generate_image's default model (${DEFAULT_MODEL}) unless the user explicitly requests a different image model.`,
       "When using generate_image, return the generated file paths to the user.",
     ],
     parameters: generateImageParameters,
@@ -104,6 +118,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      const model = params.model ?? DEFAULT_MODEL;
       const outputDir = path.resolve(ctx.cwd, params.outputDir ?? DEFAULT_OUTPUT_DIR);
       await mkdir(outputDir, { recursive: true });
 
@@ -111,7 +126,7 @@ export default function (pi: ExtensionAPI) {
         content: [
           {
             type: "text",
-            text: `Generating ${params.n ?? 1} image(s) with ${DEFAULT_MODEL}...`,
+            text: formatGenerationSummary({ ...params, model, outputDir, n: params.n ?? 1 }),
           },
         ],
         details: {},
@@ -119,7 +134,7 @@ export default function (pi: ExtensionAPI) {
 
       const gateway = createGateway({ apiKey });
       const imageOptions = {
-        model: gateway.imageModel(DEFAULT_MODEL),
+        model: gateway.imageModel(model),
         prompt: params.prompt,
         n: params.n ?? 1,
         ...(params.size ? { size: params.size as `${number}x${number}` } : {}),
@@ -152,7 +167,15 @@ export default function (pi: ExtensionAPI) {
           },
         ],
         details: {
-          model: DEFAULT_MODEL,
+          model,
+          prompt: params.prompt,
+          parameters: {
+            n: params.n ?? 1,
+            ...(params.size ? { size: params.size } : {}),
+            ...(params.aspectRatio ? { aspectRatio: params.aspectRatio } : {}),
+            ...(params.seed == null ? {} : { seed: params.seed }),
+            outputDir,
+          },
           files,
           warnings: result.warnings,
           usage: result.usage,
@@ -162,49 +185,52 @@ export default function (pi: ExtensionAPI) {
       };
     },
 
+    renderCall(args, theme, _context) {
+      const params = args as GenerateImageParams;
+      return new Text(
+        formatGenerationSummary({ ...params, model: params.model ?? DEFAULT_MODEL, n: params.n ?? 1 }),
+        0,
+        0,
+        (text: string) => theme.fg("muted", text),
+      );
+    },
+
     renderResult(result, _options, theme, _context) {
       const details = result.details as GenerateImageDetails | undefined;
-      const firstFile = details?.files?.[0];
-      const text = result.content.find(part => part.type === "text")?.text ?? "";
+      const fallbackText = result.content.find(part => part.type === "text")?.text ?? "";
 
-      if (!firstFile) {
-        return new Text(text, 0, 0);
+      if (!details) {
+        return new Text(fallbackText, 0, 0);
       }
 
-      try {
-        const imageBase64 = readFileSync(firstFile.path).toString("base64");
-        const container = new Container();
-        container.addChild(new Text(theme.fg("success", "Generated image preview:"), 0, 0));
-        container.addChild(
-          new Image(
-            imageBase64,
-            firstFile.mediaType ?? "image/png",
-            { fallbackColor: (str: string) => theme.fg("muted", str) },
-            {
-              maxWidthCells: 80,
-              maxHeightCells: 24,
-              filename: firstFile.path,
-            },
-          ),
-        );
-        container.addChild(new Text(theme.fg("muted", firstFile.path), 0, 0));
+      const lines = [
+        theme.fg("success", `Generated ${details.files.length} image(s)`),
+        `model: ${details.model}`,
+        `prompt: ${details.prompt}`,
+        `n: ${details.parameters.n}`,
+        ...(details.parameters.size ? [`size: ${details.parameters.size}`] : []),
+        ...(details.parameters.aspectRatio ? [`aspectRatio: ${details.parameters.aspectRatio}`] : []),
+        ...(details.parameters.seed == null ? [] : [`seed: ${details.parameters.seed}`]),
+        `outputDir: ${details.parameters.outputDir}`,
+        "files:",
+        ...details.files.map(file => `- ${file.path}`),
+      ];
 
-        if (details.files.length > 1) {
-          container.addChild(
-            new Text(
-              theme.fg("dim", [`Additional files:`, ...details.files.slice(1).map(file => `- ${file.path}`)].join("\n")),
-              0,
-              0,
-            ),
-          );
-        }
-
-        return container;
-      } catch (error) {
-        return new Text(`${text}\n\n${theme.fg("warning", `Could not render image preview: ${String(error)}`)}`, 0, 0);
-      }
+      return new Text(lines.join("\n"), 0, 0);
     },
   });
+}
+
+function formatGenerationSummary(params: GenerateImageParams & { model: string; n: number; outputDir?: string }) {
+  return [
+    `Generating ${params.n} image(s)`,
+    `model: ${params.model}`,
+    `prompt: ${params.prompt}`,
+    ...(params.size ? [`size: ${params.size}`] : []),
+    ...(params.aspectRatio ? [`aspectRatio: ${params.aspectRatio}`] : []),
+    ...(params.seed == null ? [] : [`seed: ${params.seed}`]),
+    ...(params.outputDir ? [`outputDir: ${params.outputDir}`] : []),
+  ].join("\n");
 }
 
 function summarizePrompt(prompt: string) {

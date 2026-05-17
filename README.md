@@ -39,6 +39,7 @@ Generated files are written to `.pi/generated-images/` in the current Pi working
 Tool options include:
 
 - `prompt` — required image prompt
+- `model` — Vercel AI Gateway image model, default `openai/gpt-image-2`; agents should not override this unless the user explicitly asks for a different model
 - `n` — number of images, default `1`
 - `size` — e.g. `1024x1024`
 - `aspectRatio` — e.g. `16:9`; do not pass with `size`
