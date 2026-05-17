@@ -20,6 +20,14 @@ Then run `/reload` in Pi.
 
 ## Extensions
 
+### `web_fetch`
+
+Registers a Pi tool named `web_fetch` that fetches a URL with text/markdown-oriented `Accept` headers and returns `response.text()`.
+
+Tool options:
+
+- `url` — URL to fetch
+
 ### `generate_image`
 
 Registers a Pi tool named `generate_image` that uses the Vercel AI Gateway image model `openai/gpt-image-2` through the AI SDK's `generateImage()` API.
