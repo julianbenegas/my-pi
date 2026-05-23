@@ -28,6 +28,32 @@ Tool options:
 
 - `url` — URL to fetch
 
+### `/btworktree`
+
+Registers a Pi slash command that runs unrelated work in an isolated git worktree with a fresh child Pi session.
+
+Usage:
+
+```text
+/btworktree <base-branch>/<worktree-name> <prompt>
+```
+
+Examples:
+
+```text
+/btworktree main/some-name do some work unrelated to what we're doing
+/btworktree feature/foo/bar/spike try an experiment from feature/foo/bar
+```
+
+Behavior:
+
+- creates the worktree at `~/.pi/worktrees/<cwd-name>/<worktree-name>`
+- creates a fresh persisted Pi session for that worktree
+- runs the prompt in a child Pi session that inherits the parent model, thinking level, and active tools
+- if the child leaves no git changes, removes the worktree directory
+- if the child leaves git changes, resumes the child session and asks it to decide whether to keep or discard them
+- if changes remain after that decision, leaves the worktree in place and reports the path, branch, session file, and git status
+
 ### `generate_image`
 
 Registers a Pi tool named `generate_image` that uses the Vercel AI Gateway image model `openai/gpt-image-2` through the AI SDK's `generateImage()` API.
