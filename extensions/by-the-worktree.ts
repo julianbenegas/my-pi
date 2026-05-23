@@ -7,6 +7,7 @@ import { type ExtensionAPI, SessionManager } from "@earendil-works/pi-coding-age
 const COMMAND = "btworktree";
 const WORKTREE_PREFIX = "pi-btworktree";
 const MAX_OUTPUT_BYTES = 50 * 1024;
+const MAX_DECISION_ATTEMPTS = 12;
 
 type CommandContext = Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1];
 
@@ -31,6 +32,18 @@ interface WorktreeRecord {
   sessionFile: string;
 }
 
+interface FinalizationState {
+  finalized: boolean;
+  outcome?: "discarded" | "pushed";
+  uncommittedStatus: string;
+  commitsAheadTarget: number;
+  upstream?: string;
+  commitsAheadUpstream?: number;
+  branchStatus: string;
+  commitsAheadTargetLog: string;
+  reason: string;
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerCommand(COMMAND, {
     description: "Run a prompt in a fresh git worktree: /btworktree <base-branch>/<worktree-name> <prompt>",
@@ -51,63 +64,41 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setWidget(COMMAND, [`btworktree ${record.name}`, `path: ${record.path}`, `branch: ${record.branch}`, "status: running"]);
 
       const inherited = getInheritedOptions(pi, ctx);
+      const runResults: ExecResult[] = [];
       const initial = buildInitialPrompt(parsed.prompt, record);
-      const first = await runPi(record.path, record.sessionFile, initial, inherited, ctx.signal);
+      runResults.push(await runPi(record.path, record.sessionFile, initial, inherited, ctx.signal));
 
-      const dirtyAfterFirst = await hasGitChanges(record.path);
-      if (!dirtyAfterFirst) {
-        ctx.ui.setWidget(COMMAND, [`btworktree ${record.name}`, "status: no git changes; cleaning up"]);
-        await removeWorktree(record);
-        ctx.ui.notify(`btworktree ${record.name}: child Pi finished with no git changes; removed ${record.path}.`, "info");
-        ctx.ui.setStatus(COMMAND, undefined);
-        ctx.ui.setWidget(COMMAND, undefined);
-        return;
-      }
-
-      ctx.ui.setWidget(COMMAND, [
-        `btworktree ${record.name}`,
-        `path: ${record.path}`,
-        `branch: ${record.branch}`,
-        "status: uncommitted changes detected; asking child to decide keep vs discard",
-      ]);
-
-      const statusBeforeDecision = await gitStatus(record.path);
-      const decisionPrompt = buildDecisionPrompt(statusBeforeDecision);
-      const second = await runPi(record.path, record.sessionFile, decisionPrompt, inherited, ctx.signal);
-      const dirtyAfterDecision = await hasGitChanges(record.path);
-
-      if (!dirtyAfterDecision) {
-        await removeWorktree(record);
-        ctx.ui.notify(`btworktree ${record.name}: child discarded/reset changes; removed ${record.path}.`, "info");
-        ctx.ui.setStatus(COMMAND, undefined);
-        ctx.ui.setWidget(COMMAND, undefined);
-        return;
-      }
-
-      ctx.ui.setWidget(COMMAND, [
-        `btworktree ${record.name}`,
-        `path: ${record.path}`,
-        `branch: ${record.branch}`,
-        "status: changes kept",
-      ]);
-
-      const finalStatus = await gitStatus(record.path);
-      ctx.ui.notify(
-        [
-          `btworktree ${record.name}: changes kept in ${record.path}`,
+      let state = await getFinalizationState(record);
+      for (let attempt = 1; !state.finalized; attempt++) {
+        ctx.ui.setWidget(COMMAND, [
+          `btworktree ${record.name}`,
+          `path: ${record.path}`,
           `branch: ${record.branch}`,
-          `session: ${record.sessionFile}`,
-          "",
-          capBytes(finalStatus.stdout || finalStatus.stderr || "(no git status output)", 4000),
-          first.code === 0 && second.code === 0 ? undefined : "",
-          first.code !== 0 ? `Initial child Pi exit code: ${first.code}\n${capBytes(first.stderr, 4000)}` : undefined,
-          second.code !== 0 ? `Decision child Pi exit code: ${second.code}\n${capBytes(second.stderr, 4000)}` : undefined,
-        ]
-          .filter((part): part is string => part !== undefined)
-          .join("\n"),
-        "info",
-      );
+          `status: awaiting commit+push or discard (${attempt})`,
+          `reason: ${state.reason}`,
+        ]);
+
+        const decisionPrompt = buildDecisionPrompt(record, state, attempt);
+        runResults.push(await runPi(record.path, record.sessionFile, decisionPrompt, inherited, ctx.signal));
+        state = await getFinalizationState(record);
+
+        if (!state.finalized && attempt >= MAX_DECISION_ATTEMPTS) {
+          const forceDiscardPrompt = buildForceDiscardPrompt(record, state);
+          runResults.push(await runPi(record.path, record.sessionFile, forceDiscardPrompt, inherited, ctx.signal));
+          state = await getFinalizationState(record);
+          if (!state.finalized) {
+            await forceDiscardLocally(record);
+            state = await getFinalizationState(record);
+          }
+        }
+      }
+
+      ctx.ui.setWidget(COMMAND, [`btworktree ${record.name}`, `status: ${state.reason}; deleting worktree`]);
+      await removeWorktree(record);
+
+      ctx.ui.notify(formatDoneNotification(record, state, runResults), "info");
       ctx.ui.setStatus(COMMAND, undefined);
+      ctx.ui.setWidget(COMMAND, undefined);
     },
   });
 }
@@ -156,10 +147,12 @@ async function createWorktree(parsed: ParsedArgs, ctx: CommandContext): Promise<
 
 function getInheritedOptions(pi: ExtensionAPI, ctx: CommandContext) {
   const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+  const tools = new Set(pi.getActiveTools());
+  tools.add("bash");
   return {
     model,
     thinking: pi.getThinkingLevel(),
-    tools: pi.getActiveTools(),
+    tools: Array.from(tools),
   };
 }
 
@@ -170,24 +163,54 @@ function buildInitialPrompt(prompt: string, record: WorktreeRecord) {
     `Branch: ${record.branch}`,
     `Base target: ${record.target}`,
     "Work independently. Keep your changes inside this worktree. Do not touch the parent worktree.",
-    "If you decide the task should not leave changes, explicitly reset/discard your work before finishing.",
-    "If you do leave changes, summarize what changed and how you validated it.",
+    "At the end of the task you may leave ordinary working-tree changes; the parent will then ask you to make the final keep/discard decision.",
+    "If you already know the work is not worth keeping, reset/clean the worktree before finishing.",
+    "If you already know the work is worth keeping, commit and push this worktree branch before finishing.",
     "",
     "User prompt:",
     prompt,
   ].join("\n");
 }
 
-function buildDecisionPrompt(status: ExecResult) {
+function buildDecisionPrompt(record: WorktreeRecord, state: FinalizationState, attempt: number) {
   return [
-    "Your previous run left uncommitted git changes in this worktree.",
-    "Decide whether these changes should be kept or discarded.",
-    "- If they should be kept, leave the git changes as-is and explain why they are worth keeping.",
-    "- If they should not be kept, reset/discard all changes so that `git status --porcelain` is empty, then explain why.",
+    `This is /btworktree finalization attempt ${attempt}.`,
+    "Your previous run did not reach a final state. You must now choose exactly one outcome:",
     "",
-    "Current git status:",
+    "1. KEEP: commit all useful work and push this worktree branch to a remote with upstream tracking set.",
+    "   Required verification before final response:",
+    "   - `git status --porcelain` is empty",
+    "   - `git rev-list --count @{u}..HEAD` is 0",
+    "   - this branch contains the commits you want to keep",
+    "",
+    "2. DISCARD: remove all work from this worktree and return it to the base target.",
+    "   Required verification before final response:",
+    `   - \`git reset --hard ${shellQuote(record.target)}\` or equivalent has removed local commits`,
+    "   - `git clean -fd` or equivalent has removed untracked files",
+    "   - `git status --porcelain` is empty",
+    `   - \`git rev-list --count ${shellQuote(record.target)}..HEAD\` is 0`,
+    "",
+    "Do not merely say the changes should be kept. If keeping, commit and push. If discarding, reset and clean.",
+    "The parent extension will keep looping until one of those final states is true, then it will delete this worktree directory.",
+    "",
+    "Current state:",
     "```",
-    capBytes(status.stdout || status.stderr || "(no output)", 12000),
+    formatFinalizationState(state),
+    "```",
+  ].join("\n");
+}
+
+function buildForceDiscardPrompt(record: WorktreeRecord, state: FinalizationState) {
+  return [
+    "You have not finalized this /btworktree after several attempts.",
+    "Now discard the work. Do not ask questions. Do not keep anything.",
+    `Run the equivalent of \`git reset --hard ${shellQuote(record.target)}\` and \`git clean -fd\`, then verify:`,
+    "- `git status --porcelain` is empty",
+    `- \`git rev-list --count ${shellQuote(record.target)}..HEAD\` is 0`,
+    "",
+    "Current state:",
+    "```",
+    formatFinalizationState(state),
     "```",
   ].join("\n");
 }
@@ -248,18 +271,132 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
   return { command: "pi", args };
 }
 
-async function hasGitChanges(cwd: string) {
-  const status = await exec("git", ["status", "--porcelain"], { cwd });
-  return status.stdout.trim().length > 0;
+async function getFinalizationState(record: WorktreeRecord): Promise<FinalizationState> {
+  const uncommittedStatus = (await exec("git", ["status", "--porcelain"], { cwd: record.path })).stdout.trim();
+  const branchStatus = (await exec("git", ["status", "--short", "--branch"], { cwd: record.path })).stdout.trim();
+  const commitsAheadTarget = await gitCount(record.path, record.target, "HEAD");
+  const commitsAheadTargetLog = (
+    await exec("git", ["log", "--oneline", "--decorate", "--max-count", "20", `${record.target}..HEAD`], { cwd: record.path })
+  ).stdout.trim();
+
+  if (uncommittedStatus) {
+    return {
+      finalized: false,
+      uncommittedStatus,
+      commitsAheadTarget,
+      branchStatus,
+      commitsAheadTargetLog,
+      reason: "uncommitted changes remain",
+    };
+  }
+
+  if (commitsAheadTarget === 0) {
+    return {
+      finalized: true,
+      outcome: "discarded",
+      uncommittedStatus,
+      commitsAheadTarget,
+      branchStatus,
+      commitsAheadTargetLog,
+      reason: "no changes or commits remain",
+    };
+  }
+
+  const upstreamResult = await exec("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], { cwd: record.path });
+  const upstream = upstreamResult.code === 0 ? upstreamResult.stdout.trim() : undefined;
+  if (!upstream) {
+    return {
+      finalized: false,
+      uncommittedStatus,
+      commitsAheadTarget,
+      branchStatus,
+      commitsAheadTargetLog,
+      reason: "local commits exist but no upstream is configured/pushed",
+    };
+  }
+
+  const commitsAheadUpstream = await gitCount(record.path, "@{u}", "HEAD");
+  if (commitsAheadUpstream > 0) {
+    return {
+      finalized: false,
+      uncommittedStatus,
+      commitsAheadTarget,
+      upstream,
+      commitsAheadUpstream,
+      branchStatus,
+      commitsAheadTargetLog,
+      reason: "local commits exist but are not pushed to upstream",
+    };
+  }
+
+  return {
+    finalized: true,
+    outcome: "pushed",
+    uncommittedStatus,
+    commitsAheadTarget,
+    upstream,
+    commitsAheadUpstream,
+    branchStatus,
+    commitsAheadTargetLog,
+    reason: `commits pushed to ${upstream}`,
+  };
 }
 
-function gitStatus(cwd: string) {
-  return exec("git", ["status", "--short", "--branch"], { cwd });
+async function gitCount(cwd: string, from: string, to: string) {
+  const result = await exec("git", ["rev-list", "--count", `${from}..${to}`], { cwd });
+  const count = Number.parseInt(result.stdout.trim(), 10);
+  return Number.isFinite(count) ? count : 0;
+}
+
+function formatFinalizationState(state: FinalizationState) {
+  return [
+    `finalized: ${state.finalized}`,
+    state.outcome ? `outcome: ${state.outcome}` : undefined,
+    `reason: ${state.reason}`,
+    `commitsAheadTarget: ${state.commitsAheadTarget}`,
+    state.upstream ? `upstream: ${state.upstream}` : "upstream: (none)",
+    state.commitsAheadUpstream !== undefined ? `commitsAheadUpstream: ${state.commitsAheadUpstream}` : undefined,
+    "",
+    "git status --short --branch:",
+    state.branchStatus || "(empty)",
+    "",
+    "git status --porcelain:",
+    state.uncommittedStatus || "(empty)",
+    "",
+    "commits ahead of target:",
+    state.commitsAheadTargetLog || "(none)",
+  ]
+    .filter((part): part is string => part !== undefined)
+    .join("\n");
+}
+
+async function forceDiscardLocally(record: WorktreeRecord) {
+  await exec("git", ["reset", "--hard", record.target], { cwd: record.path });
+  await exec("git", ["clean", "-fd"], { cwd: record.path });
 }
 
 async function removeWorktree(record: WorktreeRecord) {
   await exec("git", ["worktree", "remove", "--force", record.path], { cwd: record.root });
   await rm(record.path, { recursive: true, force: true });
+}
+
+function formatDoneNotification(record: WorktreeRecord, state: FinalizationState, runResults: ExecResult[]) {
+  const failedRuns = runResults
+    .map((result, index) => ({ result, index: index + 1 }))
+    .filter(({ result }) => result.code !== 0);
+
+  return [
+    `btworktree ${record.name}: ${state.reason}; removed ${record.path}`,
+    `branch: ${record.branch}`,
+    `session: ${record.sessionFile}`,
+    state.outcome ? `outcome: ${state.outcome}` : undefined,
+    state.upstream ? `upstream: ${state.upstream}` : undefined,
+    state.commitsAheadTargetLog ? `commits:\n${state.commitsAheadTargetLog}` : undefined,
+    failedRuns.length ? "" : undefined,
+    ...failedRuns.map(({ result, index }) => `Child Pi run ${index} exit code: ${result.code}\n${capBytes(result.stderr, 4000)}`),
+  ]
+    .filter((part): part is string => part !== undefined)
+    .join("\n");
 }
 
 function exec(
@@ -312,6 +449,10 @@ function usage() {
     `  /${COMMAND} main/some-name do some work unrelated to what we're doing`,
     `  /${COMMAND} feature/sliced/base/spike try an experiment from feature/sliced/base`,
   ].join("\n");
+}
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
 function capBytes(value: string, maxBytes: number) {

@@ -50,9 +50,10 @@ Behavior:
 - creates the worktree at `~/.pi/worktrees/<cwd-name>/<worktree-name>`
 - creates a fresh persisted Pi session for that worktree
 - runs the prompt in a child Pi session that inherits the parent model, thinking level, and active tools
-- if the child leaves no git changes, removes the worktree directory
-- if the child leaves git changes, resumes the child session and asks it to decide whether to keep or discard them
-- if changes remain after that decision, leaves the worktree in place and reports the path, branch, session file, and git status
+- loops with the child Pi until there is a final outcome:
+  - **discard**: the worktree is reset/cleaned back to the base branch
+  - **keep**: the child commits the work and pushes the worktree branch with upstream tracking
+- deletes the local worktree directory after either final outcome
 
 ### `generate_image`
 
